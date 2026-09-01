@@ -43,8 +43,13 @@ impl Engine {
                 ttl_secs,
                 value,
             } => {
-                let expire_at = now_ms() + ttl_secs * 1000;
-                self.write(key.clone(), value.clone(), Some(expire_at))
+                let expire_at = ttl_secs
+                    .checked_mul(1000)
+                    .and_then(|ttl_ms| now_ms().checked_add(ttl_ms));
+                match expire_at {
+                    Some(expire_at) => self.write(key.clone(), value.clone(), Some(expire_at)),
+                    None => Response::Err("过期时间过大".into()),
+                }
             }
             Command::Get { key } => match self.store.get(key) {
                 Some(v) => Response::Value(v.to_string()),
@@ -156,5 +161,18 @@ mod tests {
             }
             other => panic!("期望 STATS，实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn oversized_ttl_returns_error_without_breaking_engine() {
+        let mut e = Engine::open(tmp_file("ttl-overflow")).unwrap();
+        let cmd = Command::SetEx {
+            key: "k".into(),
+            ttl_secs: u64::MAX,
+            value: "v".into(),
+        };
+        assert!(matches!(e.execute(&cmd, 1), Response::Err(_)));
+        assert_eq!(run(&mut e, "SET healthy yes"), Response::Ok);
+        assert_eq!(run(&mut e, "GET healthy"), Response::Value("yes".into()));
     }
 }

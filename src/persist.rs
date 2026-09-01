@@ -14,6 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::protocol::{validate_key, validate_value};
 use crate::store::Store;
 
 /// 一条持久化记录
@@ -55,18 +56,31 @@ impl Record {
                             .map_err(|_| Error::Corrupt(format!("非法的过期时间: {t}")))?,
                     ),
                 };
+                let key = unescape(key)?;
+                let value = unescape(value)?;
+                validate_recovered(&key, &value)?;
                 Ok(Record::Set {
-                    key: unescape(key)?,
-                    value: unescape(value)?,
+                    key,
+                    value,
                     expire_at_ms,
                 })
             }
-            ["DEL", key] => Ok(Record::Del {
-                key: unescape(key)?,
-            }),
+            ["DEL", key] => {
+                let key = unescape(key)?;
+                validate_key(&key)
+                    .map_err(|e| Error::Corrupt(format!("DEL 记录的键不符合协议约束: {e}")))?;
+                Ok(Record::Del { key })
+            }
             _ => Err(Error::Corrupt(format!("字段个数或类型非法: {line}"))),
         }
     }
+}
+
+fn validate_recovered(key: &str, value: &str) -> Result<()> {
+    validate_key(key).map_err(|e| Error::Corrupt(format!("SET 记录的键不符合协议约束: {e}")))?;
+    validate_value(value)
+        .map_err(|e| Error::Corrupt(format!("SET 记录的值不符合协议约束: {e}")))?;
+    Ok(())
 }
 
 /// 追加写日志文件
@@ -213,7 +227,7 @@ mod tests {
     fn record_roundtrip() {
         for rec in [
             Record::Set {
-                key: "k 1".into(),
+                key: "k\\1".into(),
                 value: "含\t制表符和\\反斜杠".into(),
                 expire_at_ms: None,
             },
@@ -277,6 +291,22 @@ mod tests {
         write!(f, "SET\tk\t-\tv\nSET\tk2\t-\tpar").unwrap(); // 末尾无换行
         drop(f);
         assert!(matches!(AppendLog::open(&path), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn recovered_records_must_respect_protocol_limits() {
+        let bad_key = tmp_path("bad-key");
+        fs::create_dir_all(bad_key.parent().unwrap()).unwrap();
+        fs::write(&bad_key, "SET\tbad key\t-\tv\n").unwrap();
+        assert!(matches!(AppendLog::open(&bad_key), Err(Error::Corrupt(_))));
+
+        let bad_value = tmp_path("bad-value");
+        fs::create_dir_all(bad_value.parent().unwrap()).unwrap();
+        fs::write(&bad_value, "SET\tk\t-\tline1\\nline2\n").unwrap();
+        assert!(matches!(
+            AppendLog::open(&bad_value),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     #[test]

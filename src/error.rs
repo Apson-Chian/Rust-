@@ -10,6 +10,8 @@ pub enum Error {
     Protocol(String),
     /// 持久化文件内容损坏或格式非法
     Corrupt(String),
+    /// 服务器内部状态不可安全使用
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -20,6 +22,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "IO 错误: {e}"),
             Error::Protocol(m) => write!(f, "命令错误: {m}"),
             Error::Corrupt(m) => write!(f, "数据文件损坏: {m}"),
+            Error::Internal(m) => write!(f, "内部错误: {m}"),
         }
     }
 }
