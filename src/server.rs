@@ -1,43 +1,105 @@
 //! TCP 服务器：监听连接、读取请求、调用存储引擎并返回响应。
 //!
 //! 消息以 `\n` 分隔，服务器保证「一问一答」：读取到完整一行后才处理并回复。
+//! 每个连接由独立线程处理，多个线程通过 `Arc<Mutex<Engine>>` 共享同一份数据；
+//! 互斥锁只在执行一次数据操作时短暂持有，读写网络期间不持锁。
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use crate::config::ServerConfig;
 use crate::engine::Engine;
 use crate::error::Result;
 use crate::protocol::{Command, Response, MAX_LINE};
 
-/// 启动服务器：恢复数据 → 监听端口 → 逐个处理连接
+/// 服务器实例：持有监听套接字与共享的存储引擎
+pub struct Server {
+    listener: TcpListener,
+    engine: Arc<Mutex<Engine>>,
+    /// 当前在线连接数，仅用于 STATS 展示
+    clients: Arc<AtomicUsize>,
+}
+
+impl Server {
+    /// 恢复数据并绑定监听地址
+    pub fn bind(cfg: &ServerConfig) -> Result<Server> {
+        let engine = Engine::open(&cfg.data_file)?;
+        let listener = TcpListener::bind(&cfg.addr)?;
+        Ok(Server {
+            listener,
+            engine: Arc::new(Mutex::new(engine)),
+            clients: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        Ok(self.listener.local_addr()?)
+    }
+
+    pub fn key_count(&self) -> usize {
+        self.engine.lock().expect("引擎锁已中毒").key_count()
+    }
+
+    /// 循环接受连接，为每个连接创建独立线程
+    pub fn serve(&self) -> Result<()> {
+        for stream in self.listener.incoming() {
+            match stream {
+                Ok(s) => {
+                    let engine = Arc::clone(&self.engine);
+                    let clients = Arc::clone(&self.clients);
+                    // 单个连接的错误被隔离在自己的线程内，不影响服务器与其他客户端
+                    thread::spawn(move || {
+                        if let Err(e) = handle_conn(s, engine, clients) {
+                            eprintln!("[rkv-server] 连接异常结束: {e}");
+                        }
+                    });
+                }
+                Err(e) => eprintln!("[rkv-server] 接受连接失败: {e}"),
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 启动服务器（阻塞运行）
 pub fn run(cfg: &ServerConfig) -> Result<()> {
-    let mut engine = Engine::open(&cfg.data_file)?;
-    let listener = TcpListener::bind(&cfg.addr)?;
+    let server = Server::bind(cfg)?;
     println!(
         "[rkv-server] 启动成功，监听 {}，数据文件 {}，已恢复 {} 个键",
-        listener.local_addr()?,
+        server.local_addr()?,
         cfg.data_file.display(),
-        engine.key_count()
+        server.key_count()
     );
+    server.serve()
+}
 
-    for stream in listener.incoming() {
-        match stream {
-            // 单个连接出错只影响该连接，服务器继续运行
-            Ok(s) => {
-                if let Err(e) = handle_conn(s, &mut engine) {
-                    eprintln!("[rkv-server] 连接异常结束: {e}");
-                }
-            }
-            Err(e) => eprintln!("[rkv-server] 接受连接失败: {e}"),
-        }
+/// 在线连接计数的 RAII 守卫，线程结束（含 panic）时自动减一
+struct ClientGuard(Arc<AtomicUsize>);
+
+impl ClientGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        ClientGuard(counter)
     }
-    Ok(())
+}
+
+impl Drop for ClientGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// 处理单个连接上的所有请求，直到客户端 QUIT 或断开
-fn handle_conn(stream: TcpStream, engine: &mut Engine) -> Result<()> {
+fn handle_conn(
+    stream: TcpStream,
+    engine: Arc<Mutex<Engine>>,
+    clients: Arc<AtomicUsize>,
+) -> Result<()> {
     let peer = stream.peer_addr()?;
+    let _guard = ClientGuard::new(Arc::clone(&clients));
     println!("[rkv-server] 客户端接入: {peer}");
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = stream;
@@ -51,7 +113,12 @@ fn handle_conn(stream: TcpStream, engine: &mut Engine) -> Result<()> {
             // 解析失败只回错误，连接保持可用，后续合法命令照常处理
             Request::Line(line) => match Command::parse(&line) {
                 Ok(cmd) => {
-                    let resp = engine.execute(&cmd, 1);
+                    let online = clients.load(Ordering::SeqCst);
+                    // 仅在执行数据操作期间持锁
+                    let resp = {
+                        let mut engine = engine.lock().expect("引擎锁已中毒");
+                        engine.execute(&cmd, online)
+                    };
                     if cmd == Command::Quit {
                         write_response(&mut writer, &resp)?;
                         break;
