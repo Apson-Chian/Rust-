@@ -106,6 +106,11 @@ cargo test              # 全部测试
 cargo clippy --all-targets   # 静态检查
 ```
 
+## 课堂演示
+
+运行 `bash scripts/demo.sh` 可自动演示 CRUD、多客户端并发、TTL、错误隔离、
+日志压缩和重启恢复。完整的四人讲解稿与手动双终端流程见 [DEMO.md](DEMO.md)。
+
 ## 多人协作
 
 模块负责人、分支策略、任务优先级、交叉评审和完成标准见
