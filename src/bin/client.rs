@@ -51,19 +51,19 @@ fn interact(stream: TcpStream) -> std::io::Result<()> {
     print_prompt();
     for input in stdin.lock().lines() {
         let input = input?;
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
+        let command_line = input.trim_start();
+        if command_line.trim().is_empty() {
             print_prompt();
             continue;
         }
-        if trimmed.eq_ignore_ascii_case("HELP") {
+        if command_line.trim().eq_ignore_ascii_case("HELP") {
             println!("{HELP}");
             print_prompt();
             continue;
         }
 
         // 先在本地校验，非法输入无需往返服务器
-        let cmd = match Command::parse(trimmed) {
+        let cmd = match Command::parse(command_line) {
             Ok(cmd) => cmd,
             Err(e) => {
                 println!("{e}（输入 HELP 查看用法）");

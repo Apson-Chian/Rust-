@@ -6,13 +6,14 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use crate::config::ServerConfig;
 use crate::engine::Engine;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::protocol::{Command, Response, MAX_LINE};
 
 /// 服务器实例：持有监听套接字与共享的存储引擎
@@ -39,8 +40,12 @@ impl Server {
         Ok(self.listener.local_addr()?)
     }
 
-    pub fn key_count(&self) -> usize {
-        self.engine.lock().expect("引擎锁已中毒").key_count()
+    pub fn key_count(&self) -> Result<usize> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| Error::Internal("存储引擎锁已中毒".into()))?;
+        Ok(engine.key_count())
     }
 
     /// 循环接受连接，为每个连接创建独立线程
@@ -48,19 +53,54 @@ impl Server {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(s) => {
-                    let engine = Arc::clone(&self.engine);
-                    let clients = Arc::clone(&self.clients);
-                    // 单个连接的错误被隔离在自己的线程内，不影响服务器与其他客户端
-                    thread::spawn(move || {
-                        if let Err(e) = handle_conn(s, engine, clients) {
-                            eprintln!("[rkv-server] 连接异常结束: {e}");
-                        }
-                    });
+                    self.spawn_client(s);
                 }
                 Err(e) => eprintln!("[rkv-server] 接受连接失败: {e}"),
             }
         }
         Ok(())
+    }
+
+    /// 服务到收到关闭信号为止，随后等待已接入的连接线程退出。
+    ///
+    /// 主要供测试和需要优雅停机的调用方使用。调用方应先关闭客户端连接，
+    /// 再设置 `shutdown`，避免等待仍在读取请求的连接线程。
+    pub fn serve_until(&self, shutdown: &AtomicBool) -> Result<()> {
+        self.listener.set_nonblocking(true)?;
+        let mut workers = Vec::new();
+
+        while !shutdown.load(Ordering::Acquire) {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    // 部分平台会让 accept 出来的套接字继承监听器的非阻塞状态；
+                    // 连接处理仍使用阻塞式 BufRead，因此这里显式恢复。
+                    stream.set_nonblocking(false)?;
+                    workers.push(self.spawn_client(stream));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        for worker in workers {
+            worker
+                .join()
+                .map_err(|_| Error::Internal("客户端连接线程发生 panic".into()))?;
+        }
+        Ok(())
+    }
+
+    fn spawn_client(&self, stream: TcpStream) -> thread::JoinHandle<()> {
+        let engine = Arc::clone(&self.engine);
+        let clients = Arc::clone(&self.clients);
+        // 单个连接的错误被隔离在自己的线程内，不影响服务器与其他客户端
+        thread::spawn(move || {
+            if let Err(e) = handle_conn(stream, engine, clients) {
+                eprintln!("[rkv-server] 连接异常结束: {e}");
+            }
+        })
     }
 }
 
@@ -71,7 +111,7 @@ pub fn run(cfg: &ServerConfig) -> Result<()> {
         "[rkv-server] 启动成功，监听 {}，数据文件 {}，已恢复 {} 个键",
         server.local_addr()?,
         cfg.data_file.display(),
-        server.key_count()
+        server.key_count()?
     );
     server.serve()
 }
@@ -109,15 +149,16 @@ fn handle_conn(
             Request::Eof => break,
             Request::TooLong => Response::Err(format!("请求超长，上限 {MAX_LINE} 字节")),
             Request::NotUtf8 => Response::Err("请求不是合法的 UTF-8 文本".into()),
-            Request::Line(line) if line.trim().is_empty() => continue,
             // 解析失败只回错误，连接保持可用，后续合法命令照常处理
             Request::Line(line) => match Command::parse(&line) {
                 Ok(cmd) => {
                     let online = clients.load(Ordering::SeqCst);
                     // 仅在执行数据操作期间持锁
-                    let resp = {
-                        let mut engine = engine.lock().expect("引擎锁已中毒");
-                        engine.execute(&cmd, online)
+                    let resp = match engine.lock() {
+                        Ok(mut engine) => engine.execute(&cmd, online),
+                        Err(_) => {
+                            Response::Err(Error::Internal("存储引擎锁已中毒".into()).to_string())
+                        }
                     };
                     if cmd == Command::Quit {
                         write_response(&mut writer, &resp)?;

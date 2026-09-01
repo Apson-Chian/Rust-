@@ -3,7 +3,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -19,18 +20,56 @@ fn temp_data_file(name: &str) -> PathBuf {
     dir.join("rkv.log")
 }
 
-/// 在后台线程启动一台监听随机端口的服务器，返回其地址
-fn start_server(data_file: &Path) -> String {
+/// 可显式关闭并等待后台线程退出的测试服务器。
+struct TestServer {
+    addr: String,
+    shutdown: Arc<AtomicBool>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl TestServer {
+    fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    fn stop(mut self) {
+        self.shutdown_and_join();
+    }
+
+    fn shutdown_and_join(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        if let Some(worker) = self.worker.take() {
+            worker.join().expect("服务器线程发生 panic");
+        }
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.shutdown_and_join();
+    }
+}
+
+/// 在后台线程启动一台监听随机端口的服务器。
+fn start_server(data_file: &Path) -> TestServer {
     let cfg = ServerConfig {
         addr: "127.0.0.1:0".into(), // 端口 0 由系统分配
         data_file: data_file.to_path_buf(),
     };
     let server = Server::bind(&cfg).expect("服务器启动失败");
     let addr = server.local_addr().unwrap().to_string();
-    thread::spawn(move || {
-        let _ = server.serve();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
+    let worker = thread::spawn(move || {
+        server
+            .serve_until(&server_shutdown)
+            .expect("服务器运行失败");
     });
-    addr
+    TestServer {
+        addr,
+        shutdown,
+        worker: Some(worker),
+    }
 }
 
 /// 测试用的极简客户端：发送一行请求，返回一行响应
@@ -64,8 +103,8 @@ impl Client {
 #[test]
 fn single_client_full_workflow() {
     let data = temp_data_file("workflow");
-    let addr = start_server(&data);
-    let mut c = Client::connect(&addr);
+    let server = start_server(&data);
+    let mut c = Client::connect(server.addr());
 
     assert_eq!(c.send("PING"), "PONG");
     assert_eq!(c.send("GET 课程名称"), "NOT_FOUND");
@@ -83,12 +122,13 @@ fn single_client_full_workflow() {
 #[test]
 fn connection_survives_bad_commands() {
     let data = temp_data_file("badcmd");
-    let addr = start_server(&data);
-    let mut c = Client::connect(&addr);
+    let server = start_server(&data);
+    let mut c = Client::connect(server.addr());
 
     assert!(c.send("FOO bar").starts_with("ERR"));
     assert!(c.send("SET onlykey").starts_with("ERR"));
     assert!(c.send("GET a b").starts_with("ERR"));
+    assert!(c.send_raw(b"\n").starts_with("ERR"));
     // 出错后连接仍可正常工作
     assert_eq!(c.send("SET k v"), "OK");
     assert_eq!(c.send("GET k"), "VALUE v");
@@ -97,8 +137,8 @@ fn connection_survives_bad_commands() {
 #[test]
 fn oversized_and_invalid_input_are_rejected() {
     let data = temp_data_file("oversize");
-    let addr = start_server(&data);
-    let mut c = Client::connect(&addr);
+    let server = start_server(&data);
+    let mut c = Client::connect(server.addr());
 
     // 超长请求：被拒绝且连接可继续使用
     let huge = format!("SET k {}\n", "x".repeat(rkv::protocol::MAX_LINE));
@@ -113,12 +153,12 @@ fn oversized_and_invalid_input_are_rejected() {
 #[test]
 fn multiple_clients_share_data() {
     let data = temp_data_file("concurrent");
-    let addr = start_server(&data);
+    let server = start_server(&data);
 
     // 8 个客户端各写 20 个键
     let mut handles = Vec::new();
     for t in 0..8 {
-        let addr = addr.clone();
+        let addr = server.addr().to_string();
         handles.push(thread::spawn(move || {
             let mut c = Client::connect(&addr);
             for i in 0..20 {
@@ -131,7 +171,7 @@ fn multiple_clients_share_data() {
     }
 
     // 另一个客户端能看到全部数据
-    let mut checker = Client::connect(&addr);
+    let mut checker = Client::connect(server.addr());
     assert!(checker.send("STATS").starts_with("STATS keys=160"));
     assert_eq!(checker.send("GET k3_7"), "VALUE v3_7");
 }
@@ -140,16 +180,18 @@ fn multiple_clients_share_data() {
 fn data_survives_server_restart() {
     let data = temp_data_file("restart");
     {
-        let addr = start_server(&data);
-        let mut c = Client::connect(&addr);
+        let server = start_server(&data);
+        let mut c = Client::connect(server.addr());
         c.send("SET 课程名称 Rust程序设计");
         c.send("SET 临时键 临时值");
         c.send("DEL 临时键");
         c.send("QUIT");
+        // 确认旧监听器、连接线程和日志句柄均已退出，再执行真正的重启。
+        server.stop();
     }
     // 使用同一数据文件重新启动
-    let addr = start_server(&data);
-    let mut c = Client::connect(&addr);
+    let server = start_server(&data);
+    let mut c = Client::connect(server.addr());
     assert_eq!(c.send("GET 课程名称"), "VALUE Rust程序设计");
     assert_eq!(c.send("GET 临时键"), "NOT_FOUND");
 }
@@ -157,20 +199,24 @@ fn data_survives_server_restart() {
 #[test]
 fn expired_key_disappears() {
     let data = temp_data_file("ttl");
-    let addr = start_server(&data);
-    let mut c = Client::connect(&addr);
+    let server = start_server(&data);
+    let mut c = Client::connect(server.addr());
 
     assert_eq!(c.send("SETEX 验证码 1 123456"), "OK");
     assert_eq!(c.send("GET 验证码"), "VALUE 123456");
     thread::sleep(Duration::from_millis(1100));
     assert_eq!(c.send("GET 验证码"), "NOT_FOUND");
+    assert!(c
+        .send(&format!("SETEX huge {} value", u64::MAX))
+        .starts_with("ERR"));
+    assert_eq!(c.send("PING"), "PONG");
 }
 
 #[test]
 fn compact_keeps_latest_data() {
     let data = temp_data_file("compact");
-    let addr = start_server(&data);
-    let mut c = Client::connect(&addr);
+    let server = start_server(&data);
+    let mut c = Client::connect(server.addr());
 
     for i in 0..10 {
         c.send(&format!("SET k {i}"));

@@ -77,7 +77,10 @@ pub struct ServerStats {
 impl Command {
     /// 从一行文本解析命令，同时完成合法性检查。
     pub fn parse(line: &str) -> Result<Command> {
-        let line = line.trim();
+        // 只移除网络消息的行结束符和命令前导空白。SET 的值允许包含尾部空格，
+        // 因此不能对整行调用 trim()。
+        let line = line.trim_end_matches(['\r', '\n']);
+        let line = line.trim_start();
         if line.is_empty() {
             return Err(Error::Protocol("空命令".into()));
         }
@@ -91,8 +94,8 @@ impl Command {
             "SET" => {
                 let (key, value) = split_once_ws(rest);
                 let value = value.trim_start();
-                check_key(key)?;
-                check_value(value)?;
+                validate_key(key)?;
+                validate_value(value)?;
                 Ok(Command::Set {
                     key: key.to_string(),
                     value: value.to_string(),
@@ -102,8 +105,8 @@ impl Command {
                 let (key, rest) = split_once_ws(rest);
                 let (ttl, value) = split_once_ws(rest.trim_start());
                 let value = value.trim_start();
-                check_key(key)?;
-                check_value(value)?;
+                validate_key(key)?;
+                validate_value(value)?;
                 let ttl_secs: u64 = ttl
                     .parse()
                     .map_err(|_| Error::Protocol(format!("过期时间必须是正整数秒: {ttl}")))?;
@@ -181,20 +184,18 @@ impl Response {
         let (tag, rest) = split_once_ws(line);
         let rest = rest.trim_start();
         match tag {
-            "OK" => Ok(Response::Ok),
-            "VALUE" => Ok(Response::Value(rest.to_string())),
-            "NOT_FOUND" => Ok(Response::NotFound),
+            "OK" => response_no_arg("OK", rest, Response::Ok),
+            "VALUE" if !rest.is_empty() => Ok(Response::Value(rest.to_string())),
+            "VALUE" => Err(Error::Protocol("VALUE 响应缺少值".into())),
+            "NOT_FOUND" => response_no_arg("NOT_FOUND", rest, Response::NotFound),
             "KEYS" => Ok(Response::Keys(
                 rest.split_whitespace().map(String::from).collect(),
             )),
-            "STATS" => Ok(Response::Stats(ServerStats {
-                keys: parse_field(rest, "keys"),
-                clients: parse_field(rest, "clients"),
-                uptime_secs: parse_field(rest, "uptime_secs"),
-            })),
-            "PONG" => Ok(Response::Pong),
-            "BYE" => Ok(Response::Bye),
-            "ERR" => Ok(Response::Err(rest.to_string())),
+            "STATS" => parse_stats(rest).map(Response::Stats),
+            "PONG" => response_no_arg("PONG", rest, Response::Pong),
+            "BYE" => response_no_arg("BYE", rest, Response::Bye),
+            "ERR" if !rest.is_empty() => Ok(Response::Err(rest.to_string())),
+            "ERR" => Err(Error::Protocol("ERR 响应缺少错误信息".into())),
             other => Err(Error::Protocol(format!("无法识别的响应: {other}"))),
         }
     }
@@ -232,7 +233,7 @@ fn split_once_ws(s: &str) -> (&str, &str) {
 }
 
 /// 校验键：非空、无空白、不超长
-fn check_key(key: &str) -> Result<()> {
+pub(crate) fn validate_key(key: &str) -> Result<()> {
     if key.is_empty() {
         return Err(Error::Protocol("缺少键名".into()));
     }
@@ -246,7 +247,7 @@ fn check_key(key: &str) -> Result<()> {
 }
 
 /// 校验值：非空、不含换行、不超长
-fn check_value(value: &str) -> Result<()> {
+pub(crate) fn validate_value(value: &str) -> Result<()> {
     if value.is_empty() {
         return Err(Error::Protocol("缺少值".into()));
     }
@@ -265,7 +266,7 @@ fn single_key(name: &str, rest: &str) -> Result<String> {
     if !extra.trim().is_empty() {
         return Err(Error::Protocol(format!("{name} 只接受一个参数")));
     }
-    check_key(key)?;
+    validate_key(key)?;
     Ok(key.to_string())
 }
 
@@ -278,12 +279,54 @@ fn no_arg(name: &str, rest: &str, cmd: Command) -> Result<Command> {
     }
 }
 
-/// 从 `keys=3 clients=1` 这类文本中取出指定字段，缺失时返回默认值
-fn parse_field<T: std::str::FromStr + Default>(s: &str, field: &str) -> T {
-    s.split_whitespace()
-        .find_map(|kv| kv.strip_prefix(field).and_then(|v| v.strip_prefix('=')))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_default()
+fn response_no_arg(tag: &str, rest: &str, response: Response) -> Result<Response> {
+    if rest.is_empty() {
+        Ok(response)
+    } else {
+        Err(Error::Protocol(format!("{tag} 响应不应包含额外内容")))
+    }
+}
+
+/// 严格解析 STATS：三个字段必须各出现一次，值合法，且不接受未知字段。
+fn parse_stats(s: &str) -> Result<ServerStats> {
+    let mut keys = None;
+    let mut clients = None;
+    let mut uptime_secs = None;
+
+    for field in s.split_whitespace() {
+        let (name, value) = field
+            .split_once('=')
+            .ok_or_else(|| Error::Protocol(format!("STATS 字段格式非法: {field}")))?;
+        match name {
+            "keys" => parse_unique_field(&mut keys, name, value)?,
+            "clients" => parse_unique_field(&mut clients, name, value)?,
+            "uptime_secs" => parse_unique_field(&mut uptime_secs, name, value)?,
+            _ => return Err(Error::Protocol(format!("STATS 包含未知字段: {name}"))),
+        }
+    }
+
+    Ok(ServerStats {
+        keys: keys.ok_or_else(|| Error::Protocol("STATS 缺少 keys 字段".into()))?,
+        clients: clients.ok_or_else(|| Error::Protocol("STATS 缺少 clients 字段".into()))?,
+        uptime_secs: uptime_secs
+            .ok_or_else(|| Error::Protocol("STATS 缺少 uptime_secs 字段".into()))?,
+    })
+}
+
+fn parse_unique_field<T: std::str::FromStr>(
+    slot: &mut Option<T>,
+    name: &str,
+    value: &str,
+) -> Result<()> {
+    if slot.is_some() {
+        return Err(Error::Protocol(format!("STATS 字段重复: {name}")));
+    }
+    *slot = Some(
+        value
+            .parse()
+            .map_err(|_| Error::Protocol(format!("STATS 字段值非法: {name}={value}")))?,
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -318,6 +361,19 @@ mod tests {
                 value: "hello  world".into()
             }
         );
+    }
+
+    #[test]
+    fn value_keeps_trailing_spaces() {
+        let cmd = Command::parse("  SET note hello world  \n").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Set {
+                key: "note".into(),
+                value: "hello world  ".into()
+            }
+        );
+        assert_eq!(Command::parse(&cmd.encode()).unwrap(), cmd);
     }
 
     #[test]
@@ -383,6 +439,22 @@ mod tests {
             Response::Err("未知命令: FOO".into()),
         ] {
             assert_eq!(Response::parse(&resp.encode()).unwrap(), resp);
+        }
+    }
+
+    #[test]
+    fn reject_malformed_responses() {
+        for line in [
+            "OK extra",
+            "VALUE",
+            "PONG extra",
+            "ERR",
+            "STATS keys=1 clients=2",
+            "STATS keys=1 clients=x uptime_secs=3",
+            "STATS keys=1 keys=2 clients=3 uptime_secs=4",
+            "STATS keys=1 clients=2 uptime_secs=3 extra=4",
+        ] {
+            assert!(Response::parse(line).is_err(), "应拒绝响应: {line}");
         }
     }
 }
