@@ -10,6 +10,9 @@ fn main() {
             std::process::exit(1);
         }
     };
-    println!("[rkv-server] 配置: 监听 {} 数据文件 {:?}", cfg.addr, cfg.data_file);
-    println!("[rkv-server] 网络服务将在阶段五接入");
+    // 数据文件损坏等启动期错误直接退出，避免带着不完整数据对外服务
+    if let Err(e) = rkv::server::run(&cfg) {
+        eprintln!("[rkv-server] 启动失败: {e}");
+        std::process::exit(1);
+    }
 }
