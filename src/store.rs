@@ -43,7 +43,13 @@ impl Store {
 
     /// 写入或覆盖，`expire_at_ms` 为 `None` 表示永不过期
     pub fn set(&mut self, key: String, value: String, expire_at_ms: Option<u64>) {
-        self.map.insert(key, Entry { value, expire_at_ms });
+        self.map.insert(
+            key,
+            Entry {
+                value,
+                expire_at_ms,
+            },
+        );
     }
 
     /// 查询；命中已过期的键时顺带删除并返回 `None`
