@@ -1,0 +1,22 @@
+[package]
+name = "rkv"
+version = "0.1.0"
+edition = "2021"
+description = "基于 Rust 的可持久化网络键值存储系统"
+
+# 仅使用标准库，不引入第三方依赖，便于离线构建与评审
+[dependencies]
+
+# 库：协议、存储、持久化、服务器等核心逻辑
+[lib]
+name = "rkv"
+path = "src/lib.rs"
+
+# 两个可执行程序：服务器与命令行客户端
+[[bin]]
+name = "rkv-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "rkv-client"
+path = "src/bin/client.rs"
